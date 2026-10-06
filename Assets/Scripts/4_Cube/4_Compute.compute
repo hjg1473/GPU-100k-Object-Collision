@@ -1,0 +1,203 @@
+
+#pragma kernel main
+
+#pragma kernel ClearCellCounts
+#pragma kernel ClearCellWriteCounters
+#pragma kernel UpdateCellCounts
+#pragma kernel UpdateObjectIDs
+#pragma kernel UpdateCellStarts
+#pragma kernel InclusiveToExclusive
+
+uint _Count;
+float _CellSize;
+float3 _WorldMin;
+uint _GridSize;
+
+RWStructuredBuffer<float3> _Positions;
+RWStructuredBuffer<uint> _Collisions;
+
+RWStructuredBuffer<uint> _CellCounts;
+RWStructuredBuffer<uint> _ObjectIDs;
+RWStructuredBuffer<uint> _CellStarts;
+
+RWStructuredBuffer<uint> _CellWriteCounters;
+
+StructuredBuffer<uint> _PrefixInput;
+RWStructuredBuffer<uint> _PrefixOutput;
+
+uint _Offset;
+
+float Random(uint seed)
+{
+    return frac(sin(seed) * 12345.6789);
+}
+
+int3 ConvertCell(float3 pos)
+{
+    return (int3)floor((pos - _WorldMin) / _CellSize);
+}
+
+uint CellToIndex(int3 cell)
+{
+    return cell.x + cell.y * _GridSize + cell.z * _GridSize * _GridSize;
+}
+
+
+[numthreads(64,1,1)]
+void ClearCellCounts(uint3 id : SV_DispatchThreadID)
+{
+    uint cellIndex = id.x;
+    uint cellRange = _GridSize * _GridSize * _GridSize;
+
+    if (cellIndex >= cellRange) return;
+
+    _CellCounts[cellIndex] = 0;
+}
+
+[numthreads(64,1,1)]
+void ClearCellWriteCounters(uint3 id : SV_DispatchThreadID)
+{
+    uint cellIndex = id.x;
+    uint cellRange = _GridSize * _GridSize * _GridSize;
+
+    if (cellIndex >= cellRange) return;
+
+    _CellWriteCounters[cellIndex] = 0;
+}
+
+[numthreads(64,1,1)]
+void UpdateCellCounts(uint3 id : SV_DispatchThreadID)
+{
+    uint objectID = id.x;
+
+    if (objectID >= _Count) return;
+    
+    float3 pos = _Positions[objectID];
+    int3 cell = ConvertCell(pos);
+
+    if (cell.x < 0 || cell.x >= (int)_GridSize ||
+        cell.y < 0 || cell.y >= (int)_GridSize ||
+        cell.z < 0 || cell.z >= (int)_GridSize)
+        return;
+
+    uint cellIndex = CellToIndex(cell);
+
+    InterlockedAdd(_CellCounts[cellIndex], 1);
+}
+
+[numthreads(64,1,1)]
+void UpdateObjectIDs(uint3 id : SV_DispatchThreadID)
+{
+    uint objectID = id.x;
+    if (objectID >= _Count) return;
+
+    float3 pos = _Positions[objectID];
+
+    int3 cell = ConvertCell(pos);
+    
+    if (cell.x < 0 || cell.x >= (int)_GridSize ||
+        cell.y < 0 || cell.y >= (int)_GridSize ||
+        cell.z < 0 || cell.z >= (int)_GridSize)
+        return;
+
+    uint cellIndex = CellToIndex(cell);
+
+    uint localIdx;
+    InterlockedAdd(_CellWriteCounters[cellIndex], 1, localIdx);
+
+    uint idx = _CellStarts[cellIndex] + localIdx; 
+
+    _ObjectIDs[idx] = objectID;
+}
+
+[numthreads(64,1,1)]
+void UpdateCellStarts(uint3 id : SV_DispatchThreadID)
+{
+    uint cellIndex = id.x;
+    uint cellRange = _GridSize * _GridSize * _GridSize;
+
+    if (cellIndex >= cellRange) return;
+
+    uint value = _PrefixInput[cellIndex];
+
+    if (cellIndex >= _Offset)
+        value += _PrefixInput[cellIndex - _Offset]; // 자기 자신 + offset만큼 앞의 거를 더함.
+    
+    _PrefixOutput[cellIndex] = value;
+}
+
+[numthreads(64,1,1)]
+void InclusiveToExclusive(uint3 id : SV_DispatchThreadID)
+{
+    uint cellIndex = id.x;
+    uint cellRange = _GridSize * _GridSize * _GridSize;
+
+    if (cellIndex >= cellRange) return;
+    
+    if (cellIndex == 0) _CellStarts[0] = 0;
+    else _CellStarts[cellIndex] = _PrefixInput[cellIndex-1];
+}
+
+[numthreads(64,1,1)]
+void main (uint3 id : SV_DispatchThreadID)
+{    
+    uint objectID = id.x;
+
+    if (objectID >= _Count) return;
+
+    _Collisions[objectID] = 0;
+    float3 myPos = _Positions[objectID];
+
+    int3 myCell = ConvertCell(myPos);
+
+    if (myCell.x < 0 || myCell.x >= (int)_GridSize ||
+        myCell.y < 0 || myCell.y >= (int)_GridSize ||
+        myCell.z < 0 || myCell.z >= (int)_GridSize)
+        return;
+            
+    bool collided = false;
+
+    // Uniform-Grid Collision Detection
+    for (int x = -1; x <= 1 && !collided; x++) {
+        for (int y = -1; y <= 1 && !collided; y++) {
+            for (int z = -1; z <= 1 && !collided; z++) {
+                
+                int3 neighborCell = myCell + int3(x, y, z);                
+
+                if (neighborCell.x < 0 || neighborCell.x >= (int)_GridSize ||
+                    neighborCell.y < 0 || neighborCell.y >= (int)_GridSize ||
+                    neighborCell.z < 0 || neighborCell.z >= (int)_GridSize)
+                {
+                    continue;
+                }                  
+                
+                uint neighborIdx = CellToIndex(neighborCell);
+
+                uint cnt = _CellCounts[neighborIdx];
+                uint start = _CellStarts[neighborIdx];
+
+                for (uint k = start; k < start + cnt; k++)
+                {
+                    uint neighborObjectID = _ObjectIDs[k];  
+
+                    if (neighborObjectID == objectID) continue;
+
+                    float3 neighborPos = _Positions[neighborObjectID];
+
+                    float dist = distance(myPos, neighborPos);
+
+                    if (dist < 1.1f) {
+                        collided = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (collided) _Collisions[objectID] = 1;
+
+    float3 velocity = float3(Random(objectID), Random(objectID + 1), Random(objectID + 2));
+
+    _Positions[objectID] += velocity * 0.1;
+}
