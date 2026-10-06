@@ -1,0 +1,24 @@
+
+#pragma kernel calculateVelocity
+
+RWStructuredBuffer<float3> _Positions;
+
+uint _Count;
+
+
+float Random(uint seed)
+{
+    return frac(sin(seed) * 12345.6789);
+}
+
+[numthreads(64,1,1)]
+void calculateVelocity (uint3 id : SV_DispatchThreadID)
+{    
+    uint i = id.x;
+
+    if (i >= _Count) return;
+
+    float3 velocity = float3(Random(i), Random(i + 1), Random(i + 2));
+
+    _Positions[i] += velocity * 0.1;
+}
