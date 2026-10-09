@@ -1,181 +1,74 @@
-
-#pragma kernel main
-
-#pragma kernel ClearCellCounts
-#pragma kernel ClearCellWriteCounters
+#pragma kernel InitializeBodies
+#pragma kernel ClearGrid
 #pragma kernel UpdateCellCounts
 #pragma kernel UpdateObjectIDs
-#pragma kernel UpdateCellStarts
-#pragma kernel InclusiveToExclusive
-
+#pragma kernel ScanBlocks
+#pragma kernel AddBlockOffsets
+#pragma kernel ResetCounters
+#pragma kernel FinalizeContacts
 #pragma kernel ApplyGravity
-
 #pragma kernel ClearContactHeads
 #pragma kernel BuildContactLinks
-
 #pragma kernel SolveContactImpulses
 #pragma kernel ApplyContactImpulses
 #pragma kernel BuildContacts
 #pragma kernel BuildFloorContacts
+#pragma kernel main
 
+// Equal unit cubes: inverse mass = 1, isotropic inverse inertia = 6.
+// All contact normals point A -> B (outward for a static boundary).
 struct ContactConstraint
 {
     uint bodyA;
-    uint bodyB; 
-
+    uint bodyB;
     float3 p;
     float3 normal;
-
     float penetration;
     float accumulatedNormalImpulse;
+    float3 accumulatedTangentImpulse;
+    float targetVelocity;
 };
+struct ContactPoint { float3 pos; float penetration; };
+struct Contact { bool hit; float3 normal; float penetration; ContactPoint points[8]; uint pointCount; };
+struct AxisResult { bool separated; float overlap; };
 
-struct ContactPoint
-{
-    float3 pos;
-    float penetration;
-};
-
-struct Contact
-{
-    bool hit;
-    float3 normal;
-    float penetration; // 물체가 얼마나 겹쳤는지
-    
-    ContactPoint points[8];
-    uint pointCount;
-};
-
-struct AxisResult
-{
-    bool separated;
-    float overlap;
-};
-
-float _DeltaTime;
-
-uint _Count;
-float _CellSize;
+float _DeltaTime, _CellSize, _Friction, _Restitution, _LinearDamping, _AngularDamping;
 float3 _WorldMin;
-uint _GridSize;
-
-uint _MaxContacts;
-
-uint _Offset;
-
+uint _Count, _GridSize, _MaxContacts, _ScanLength, _SolverIteration, _SpawnWidth;
 static const uint FLOOR_BODY = 0xFFFFFFFFu;
-
-RWStructuredBuffer<uint> _Collisions;
-
-RWStructuredBuffer<uint> _CellCounts;
-RWStructuredBuffer<uint> _ObjectIDs;
-RWStructuredBuffer<uint> _CellStarts;
-
-RWStructuredBuffer<uint> _CellWriteCounters;
-
-StructuredBuffer<uint> _PrefixInput;
-RWStructuredBuffer<uint> _PrefixOutput;
-
+RWStructuredBuffer<uint> _CellCounts, _ObjectIDs, _CellStarts, _CellWriteCounters;
+StructuredBuffer<uint> _PrefixInput, _BlockOffsets;
+RWStructuredBuffer<uint> _PrefixOutput, _BlockSums;
 RWStructuredBuffer<float3> _Positions;
-
-StructuredBuffer<float3> _Velocities;
-RWStructuredBuffer<float3> _NextVelocities;
-
 RWStructuredBuffer<float4> _Rotations;
-
-StructuredBuffer<float3> _AngularVelocities;
-RWStructuredBuffer<float3> _NextAngularVelocities;
-
+StructuredBuffer<float3> _Velocities, _AngularVelocities;
+RWStructuredBuffer<float3> _NextVelocities, _NextAngularVelocities;
 RWStructuredBuffer<ContactConstraint> _ContactConstraints;
+// requested contacts, maximum cell occupancy, boundary projections, invalid bodies
 RWStructuredBuffer<uint> _ContactCount;
-RWStructuredBuffer<float> _ContactDeltaImpulses;
+RWStructuredBuffer<float3> _ContactDeltaImpulses;
+RWStructuredBuffer<uint> _BodyContactHeads, _BodyContactCounts, _ContactNextA, _ContactNextB;
+RWByteAddressBuffer _DispatchArgs;
+StructuredBuffer<ContactConstraint> _ReadContacts;
+StructuredBuffer<uint> _ReadHeads, _ReadNextA, _ReadNextB;
+groupshared uint scanValues[256];
 
-RWStructuredBuffer<uint> _BodyContactHeads;
-
-RWStructuredBuffer<uint> _ContactNextA;
-RWStructuredBuffer<uint> _ContactNextB;
-
-
-float Random(uint seed)
-{
-    return frac(sin(seed) * 12345.6789);
-}
-
-int3 ConvertCell(float3 pos)
-{
-    return (int3)floor((pos - _WorldMin) / _CellSize);
-}
-
-uint CellToIndex(int3 cell)
-{
-    return cell.x + cell.y * _GridSize + cell.z * _GridSize * _GridSize;
-}
-
-bool IsValidCell(int3 cell)
-{
-    return cell.x >= 0 && cell.x < (int)_GridSize &&
-           cell.y >= 0 && cell.y < (int)_GridSize &&
-           cell.z >= 0 && cell.z < (int)_GridSize;
-}
-
+int3 ConvertCell(float3 pos) { return (int3)floor((pos - _WorldMin) / _CellSize); }
+uint CellToIndex(int3 cell) { return cell.x + cell.y * _GridSize + cell.z * _GridSize * _GridSize; }
+bool IsValidCell(int3 c) { return all(c >= 0) && all(c < (int)_GridSize); }
 float3 RotateByQuaternion(float3 v, float4 q)
 {
-    float3 qv = q.xyz;
-
-    return v
-        + 2.0f * q.w * cross(qv, v)
-        + 2.0f * cross(qv, cross(qv, v));
+    return v + 2.0f * q.w * cross(q.xyz, v) + 2.0f * cross(q.xyz, cross(q.xyz, v));
 }
-
-float3 ResolveBoundaryVelocity(float3 pos, float3 velocity)
+uint Hash(uint x)
 {
-    float3 worldMin = _WorldMin;
-    float3 worldMax = _WorldMin + _GridSize * _CellSize;
-
-    if (pos.x <= worldMin.x && velocity.x < 0) velocity.x *= -1;
-    if (pos.x >= worldMax.x && velocity.x > 0) velocity.x *= -1;
-
-    if (pos.y >= worldMax.y && velocity.y > 0) velocity.y *= -1;
-
-    if (pos.z <= worldMin.z && velocity.z < 0) velocity.z *= -1;
-    if (pos.z >= worldMax.z && velocity.z > 0) velocity.z *= -1;
-
-    return velocity;
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; return x ^ (x >> 16);
 }
-
-// float3 ResolveCollision(float3 myPos, float3 myVelocity, float3 otherPos, float3 otherVelocity)
-// {
-//     float3 delta = myPos - otherPos;
-//     float distSq = dot(delta, delta);
-
-//     if (distSq < 0.000001f) return myVelocity;
-
-//     float3 normal = delta * rsqrt(distSq);
-
-//     float3 relativeVelocity = myVelocity - otherVelocity;
-    
-//     float velocityAlongNormal = dot(relativeVelocity, normal);
-
-//     if (velocityAlongNormal >= 0.0f) return myVelocity;
-
-//     float restitution = 0.8f; // 탄성계수
-
-//     float invMassA = 1.0f; // 질량 1
-//     float invMassB = 1.0f; 
-
-//     float j = -(1.0f + restitution) * velocityAlongNormal / (invMassA + invMassB);
-
-//     float3 impulse = j * normal;
-
-//     float3 newVelocity = myVelocity + impulse * invMassA;
-
-//     return newVelocity;
-// }
-
+float Random01(uint seed) { return (Hash(seed) & 0x00ffffffu) / 16777216.0f; }
 void GetFaceVertices(float3 center, float3 axes[3], float3 halfExtents, int axisIndex, float faceSign, out float3 vertices[4])
 {
-    int u = (axisIndex + 1) % 3;
-    int v = (axisIndex + 2) % 3;
+    int u = ((uint)axisIndex + 1u) % 3u;
+    int v = ((uint)axisIndex + 2u) % 3u;
 
     float3 faceCenter = center + axes[axisIndex] * halfExtents[axisIndex] * faceSign;
 
@@ -197,10 +90,10 @@ void ClipPolygonAgainstPlane(
     outputCount = 0;
     // 다각형의 모서리를 하나씩 순회한다.
     //    P0 → P1, P1 → P2, ... 마지막 → 처음
-    for (uint i = 0; i < inputCount; i++)
+    for (uint edge = 0; edge < inputCount; edge++)
     {
-        float3 S = inputVertices[i];
-        float3 E = inputVertices[(i+1) % inputCount];
+        float3 S = inputVertices[edge];
+        float3 E = inputVertices[(edge+1) % inputCount];
         // 각 모서리의 시작점 S와 끝점 E가
         //    경계 안쪽인지 바깥쪽인지 판단한다.
         float3 relativeS = planePoint - S;
@@ -266,30 +159,30 @@ void GenerateFaceContacts(
     uint incidentCount;
 
     [unroll]
-    for (int i = 0; i < 8; i++)
+    for (int vertexIndex = 0; vertexIndex < 8; vertexIndex++)
     {
-        incidentVertices[i] = float3(0.0f, 0.0f, 0.0f);
+        incidentVertices[vertexIndex] = float3(0.0f, 0.0f, 0.0f);
     }
 
     float3 incCenter = refIsA ? posB : posA;
     float3 incAxes[3];
 
-    for (int i = 0; i < 3; i++)
+    for (int copyAxis = 0; copyAxis < 3; copyAxis++)
     {
-        incAxes[i] = refIsA ? B[i] : A[i];
+        incAxes[copyAxis] = refIsA ? B[copyAxis] : A[copyAxis];
     }
 
     int incAxisIndex = 0;
     float maxDot = -1.0f; // ref, inc dot 최대값
 
-    for (int i = 0; i < 3; i++)
+    for (int candidateAxis = 0; candidateAxis < 3; candidateAxis++)
     {
-        float d = abs(dot(incAxes[i], refNormal));
+        float d = abs(dot(incAxes[candidateAxis], refNormal));
 
         if (d > maxDot)
         {
             maxDot = d;
-            incAxisIndex = i;
+            incAxisIndex = candidateAxis;
         }
     }
 
@@ -298,8 +191,8 @@ void GenerateFaceContacts(
 
     float3 incFaceCenter = incCenter + incAxes[incAxisIndex] * 0.5f * incSign;
     
-    int incUIndex = (incAxisIndex + 1) % 3;
-    int incVIndex = (incAxisIndex + 2) % 3;
+    int incUIndex = ((uint)incAxisIndex + 1u) % 3u;
+    int incVIndex = ((uint)incAxisIndex + 2u) % 3u;
 
     float3 incU = incAxes[incUIndex] * 0.5f;
     float3 incV = incAxes[incVIndex] * 0.5f;
@@ -316,13 +209,13 @@ void GenerateFaceContacts(
     float3 U; float3 V;
     if (refIsA) 
     {
-        U = A[(refAxisIndex + 1) % 3];
-        V = A[(refAxisIndex + 2) % 3];
+        U = A[((uint)refAxisIndex + 1u) % 3u];
+        V = A[((uint)refAxisIndex + 2u) % 3u];
     }
     else 
     {
-        U = B[(refAxisIndex + 1) % 3];
-        V = B[(refAxisIndex + 2) % 3];
+        U = B[((uint)refAxisIndex + 1u) % 3u];
+        V = B[((uint)refAxisIndex + 2u) % 3u];
     }
     
     // Clip 하기
@@ -335,14 +228,14 @@ void GenerateFaceContacts(
     ClipPolygonAgainstPlane(clippedVertices, clippedCount, refFaceCenter - V * 0.5f, -V, incidentVertices, incidentCount);
 
     // penetration 계산
-    for (uint i = 0; i < incidentCount; i++)
+    for (uint pointIndex = 0; pointIndex < incidentCount; pointIndex++)
     {
-        float3 contactPos = incidentVertices[i];
+        float3 contactPos = incidentVertices[pointIndex];
 
         float distance = dot(contactPos - refFaceCenter, refNormal);
 
         if (distance <= 0.0f) {
-            contacts[contactCount].pos = contactPos;
+            contacts[contactCount].pos = contactPos - 0.5f * distance * refNormal;
             contacts[contactCount].penetration = -distance;
             contactCount++;
         }
@@ -407,6 +300,7 @@ void ClosestPointsOnLines(
         }
     }
         
+    closestA = a0; closestB = b0;
     float minDistSq = 1e30f;
 
     UpdateClosestPair(a0, ClosestPointOnSegment(a0, b0, b1), minDistSq, closestA, closestB);
@@ -422,21 +316,21 @@ void GenerateEdgeContact(
     out ContactPoint contactPoint)
 {
     
-    int edgeIndex = minAxisIndex - 6;
-    int axisAIndex = edgeIndex / 3;
-    int axisBIndex = edgeIndex % 3; // 축 선택
+    uint edgeIndex = (uint)(minAxisIndex - 6);
+    uint axisAIndex = edgeIndex / 3u;
+    uint axisBIndex = edgeIndex % 3u; // 축 선택
 
     // 1. A의 실제 모서리 선택
-    int aU = (axisAIndex+1) % 3;
-    int aV = (axisAIndex+2) % 3;
+    int aU = ((uint)axisAIndex + 1u) % 3u;
+    int aV = ((uint)axisAIndex + 2u) % 3u;
     float signAU = dot(A[aU], normal) >= 0.0f ? 1.0f : -1.0f;
     float signAV = dot(A[aV], normal) >= 0.0f ? 1.0f : -1.0f;
 
     float3 edgeCenterA = posA + A[aU] * 0.5f * signAU + A[aV] * 0.5f * signAV;
 
     // 2. B의 실제 모서리 선택
-    int bU = (axisBIndex+1) % 3;
-    int bV = (axisBIndex+2) % 3;
+    int bU = ((uint)axisBIndex + 1u) % 3u;
+    int bV = ((uint)axisBIndex + 2u) % 3u;
     float signBU = dot(B[bU], -normal) >= 0.0f ? 1.0f : -1.0f;
     float signBV = dot(B[bV], -normal) >= 0.0f ? 1.0f : -1.0f;
 
@@ -477,7 +371,7 @@ AxisResult TestAxis(float3 axis,
                halfB.y * abs(dot(By, axis)) +
                halfB.z * abs(dot(Bz, axis));
 
-    float distance = abs(centerB - centerA);
+    float distance = abs(dot(posB - posA, axis));
 
     result.overlap = (rA + rB) - distance;
     result.separated = result.overlap < 0.0f;    
@@ -495,10 +389,10 @@ Contact Narrow_Phase(float3 posA, float3 posB, float4 rotA, float4 rotB)
     contact.penetration = 0;
     contact.pointCount = 0;    
 
-    for (uint i = 0; i < 8; i++)
+    for (uint resetPoint = 0; resetPoint < 8; resetPoint++)
     {
-        contact.points[i].pos = float3(0,0,0);
-        contact.points[i].penetration = 0.0f;
+        contact.points[resetPoint].pos = float3(0,0,0);
+        contact.points[resetPoint].penetration = 0.0f;
     }
 
     float3 axes[15];
@@ -517,10 +411,10 @@ Contact Narrow_Phase(float3 posA, float3 posB, float4 rotA, float4 rotB)
     axes[3] = B[0]; axes[4] = B[1]; axes[5] = B[2];
 
     int index = 6;
-    for (int i=0; i<3; i++)
+    for (int axisA=0; axisA<3; axisA++)
     for (int j=0; j<3; j++)
     {
-        axes[index++] = cross(A[i], B[j]);
+        axes[index++] = cross(A[axisA], B[j]);
     }
 
     // 분리축 찾기
@@ -531,9 +425,9 @@ Contact Narrow_Phase(float3 posA, float3 posB, float4 rotA, float4 rotB)
     float3 halfA = float3(0.5f, 0.5f, 0.5f);
     float3 halfB = float3(0.5f, 0.5f, 0.5f);
 
-    for (int i=0; i<15; i++)
+    for (int axisIndex=0; axisIndex<15; axisIndex++)
     {
-        float3 axis = axes[i];
+        float3 axis = axes[axisIndex];
 
         if (dot(axis, axis) < 1e-8f) continue;
 
@@ -545,11 +439,11 @@ Contact Narrow_Phase(float3 posA, float3 posB, float4 rotA, float4 rotB)
             return contact; 
         }
 
-        if (result.overlap < minOverlap)
+        if (result.overlap < minOverlap - (axisIndex >= 6 ? 0.001f : 0.0f))
         {
             minOverlap = result.overlap;
             minAxis = normalize(axis);
-            minAxisIndex = i;
+            minAxisIndex = axisIndex;
         }
 
     }
@@ -598,119 +492,111 @@ float4 IntegrateRotation(float4 rotation, float3 angularVelocity, float dt)
     return normalize(result);
 }
 
-Contact GenerateFloorContact()
+[numthreads(64,1,1)]
+void InitializeBodies(uint3 id : SV_DispatchThreadID)
 {
-
+    uint i = id.x;
+    if (i >= _Count) return;
+    uint width = _SpawnWidth;
+    uint x = i % width, y = (i / width) % width, z = i / (width * width);
+    float margin = (_GridSize * _CellSize - (width - 1) * 1.15f) * 0.5f;
+    _Positions[i] = _WorldMin + float3(margin + x * 1.15f, 2.0f + y * 1.15f, margin + z * 1.15f);
+    float yaw = (Random01(i + 19u) - 0.5f) * 0.16f;
+    _Rotations[i] = float4(0, sin(yaw * 0.5f), 0, cos(yaw * 0.5f));
+    _NextVelocities[i] = float3(Random01(i + 23u) - 0.5f, 0, Random01(i + 47u) - 0.5f) * 0.1f;
+    _NextAngularVelocities[i] = 0;
 }
 
-void SolveFloorContactPoint()
+[numthreads(1,1,1)]
+void ResetCounters(uint3 id : SV_DispatchThreadID)
 {
-
+    _ContactCount[0] = 0; _ContactCount[1] = 0; _ContactCount[2] = 0; _ContactCount[3] = 0;
 }
 
 [numthreads(64,1,1)]
-void ClearCellCounts(uint3 id : SV_DispatchThreadID)
+void ClearGrid(uint3 id : SV_DispatchThreadID)
 {
-    uint cellIndex = id.x;
-    uint cellRange = _GridSize * _GridSize * _GridSize;
-
-    if (cellIndex >= cellRange) return;
-
-    _CellCounts[cellIndex] = 0;
-}
-
-[numthreads(64,1,1)]
-void ClearCellWriteCounters(uint3 id : SV_DispatchThreadID)
-{
-    uint cellIndex = id.x;
-    uint cellRange = _GridSize * _GridSize * _GridSize;
-
-    if (cellIndex >= cellRange) return;
-
-    _CellWriteCounters[cellIndex] = 0;
+    if (id.x >= _GridSize * _GridSize * _GridSize) return;
+    _CellCounts[id.x] = 0;
+    _CellWriteCounters[id.x] = 0;
 }
 
 [numthreads(64,1,1)]
 void UpdateCellCounts(uint3 id : SV_DispatchThreadID)
 {
-    uint objectID = id.x;
-
-    if (objectID >= _Count) return;
-    
-    float3 pos = _Positions[objectID];
-    int3 cell = ConvertCell(pos);
-
+    if (id.x >= _Count) return;
+    int3 cell = ConvertCell(_Positions[id.x]);
     if (!IsValidCell(cell)) return;
+    uint oldCount;
+    InterlockedAdd(_CellCounts[CellToIndex(cell)], 1, oldCount);
+    InterlockedMax(_ContactCount[1], oldCount + 1);
+}
 
-    uint cellIndex = CellToIndex(cell);
+// Work-efficient exclusive Blelloch scan. Every lane participates, including the padded tail.
+[numthreads(256,1,1)]
+void ScanBlocks(uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
+{
+    uint index = group.x * 256u + lane;
+    scanValues[lane] = index < _ScanLength ? _PrefixInput[index] : 0;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint upStride = 1; upStride < 256; upStride <<= 1)
+    {
+        uint k = (lane + 1) * upStride * 2 - 1;
+        if (k < 256) scanValues[k] += scanValues[k - upStride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (lane == 0)
+    {
+        _BlockSums[group.x] = scanValues[255];
+        scanValues[255] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint downStride = 128; downStride > 0; downStride >>= 1)
+    {
+        uint k = (lane + 1) * downStride * 2 - 1;
+        if (k < 256)
+        {
+            uint left = scanValues[k - downStride];
+            scanValues[k - downStride] = scanValues[k];
+            scanValues[k] += left;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (index < _ScanLength) _PrefixOutput[index] = scanValues[lane];
+}
 
-    InterlockedAdd(_CellCounts[cellIndex], 1);
+[numthreads(256,1,1)]
+void AddBlockOffsets(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _ScanLength) _PrefixOutput[id.x] += _BlockOffsets[id.x / 256];
 }
 
 [numthreads(64,1,1)]
 void UpdateObjectIDs(uint3 id : SV_DispatchThreadID)
 {
-    uint objectID = id.x;
-    if (objectID >= _Count) return;
-
-    float3 pos = _Positions[objectID];
-
-    int3 cell = ConvertCell(pos);
-    
+    if (id.x >= _Count) return;
+    int3 cell = ConvertCell(_Positions[id.x]);
     if (!IsValidCell(cell)) return;
-
-    uint cellIndex = CellToIndex(cell);
-
-    uint localIdx;
-    InterlockedAdd(_CellWriteCounters[cellIndex], 1, localIdx);
-
-    uint idx = _CellStarts[cellIndex] + localIdx; 
-
-    _ObjectIDs[idx] = objectID;
-}
-
-[numthreads(64,1,1)]
-void UpdateCellStarts(uint3 id : SV_DispatchThreadID)
-{
-    uint cellIndex = id.x;
-    uint cellRange = _GridSize * _GridSize * _GridSize;
-
-    if (cellIndex >= cellRange) return;
-
-    uint value = _PrefixInput[cellIndex];
-
-    if (cellIndex >= _Offset)
-        value += _PrefixInput[cellIndex - _Offset]; // 자기 자신 + offset만큼 앞의 거를 더함.
-    
-    _PrefixOutput[cellIndex] = value;
-}
-
-[numthreads(64,1,1)]
-void InclusiveToExclusive(uint3 id : SV_DispatchThreadID)
-{
-    uint cellIndex = id.x;
-    uint cellRange = _GridSize * _GridSize * _GridSize;
-
-    if (cellIndex >= cellRange) return;
-    
-    if (cellIndex == 0) _CellStarts[0] = 0;
-    else _CellStarts[cellIndex] = _PrefixInput[cellIndex-1];
+    uint cellIndex = CellToIndex(cell), offset;
+    InterlockedAdd(_CellWriteCounters[cellIndex], 1, offset);
+    _ObjectIDs[_CellStarts[cellIndex] + offset] = id.x;
 }
 
 [numthreads(64,1,1)]
 void ApplyGravity(uint3 id : SV_DispatchThreadID)
 {
-    uint objectID = id.x;
-    
-    if (objectID >= _Count) return;
-    
-    float3 pos = _Positions[objectID];
-    float3 velocity = _Velocities[objectID];
-    velocity += float3(0, -9.81f, 0) * _DeltaTime;
+    if (id.x >= _Count) return;
+    _NextVelocities[id.x] = (_Velocities[id.x] + float3(0, -9.81f, 0) * _DeltaTime) / (1 + _LinearDamping * _DeltaTime);
+}
 
-    velocity = ResolveBoundaryVelocity(pos, velocity);
-
-    _NextVelocities[objectID] = velocity;
+void AppendContact(uint a, uint b, float3 p, float3 normal, float penetration)
+{
+    uint index;
+    InterlockedAdd(_ContactCount[0], 1, index);
+    if (index >= _MaxContacts) return;
+    ContactConstraint c = (ContactConstraint)0;
+    c.bodyA = a; c.bodyB = b; c.p = p; c.normal = normal; c.penetration = penetration;
+    _ContactConstraints[index] = c;
 }
 
 [numthreads(64,1,1)]
@@ -718,64 +604,55 @@ void BuildContacts(uint3 id : SV_DispatchThreadID)
 {
     uint myID = id.x;
     if (myID >= _Count) return;
-
     float3 myPos = _Positions[myID];
     float4 myRot = _Rotations[myID];
-
     int3 myCell = ConvertCell(myPos);
-
     if (!IsValidCell(myCell)) return;
-
-    // ---------- Broad Phase ----------
     for (int x = -1; x <= 1; x++)
-    for (int y = -1; y <= 1; y++) 
-    for (int z = -1; z <= 1; z++) 
-    {        
-        int3 otherCell = myCell + int3(x, y, z);                
-
-        if (!IsValidCell(otherCell)) continue;
-        
-        uint otherCellIndex = CellToIndex(otherCell);
-
-        uint cnt = _CellCounts[otherCellIndex];
-        uint start = _CellStarts[otherCellIndex];
-
-        for (uint k = start; k < start + cnt; k++)
+    for (int y = -1; y <= 1; y++)
+    for (int z = -1; z <= 1; z++)
+    {
+        int3 cell = myCell + int3(x, y, z);
+        if (!IsValidCell(cell)) continue;
+        uint ci = CellToIndex(cell), start = _CellStarts[ci], end = start + _CellCounts[ci];
+        for (uint k = start; k < end; k++)
         {
-            uint otherID = _ObjectIDs[k];  
-
+            uint otherID = _ObjectIDs[k];
             if (otherID <= myID) continue;
-
             float3 otherPos = _Positions[otherID];
-            float4 otherRot = _Rotations[otherID];
-            // ---------- Narrow Phase ----------
-            Contact contact = Narrow_Phase(myPos, otherPos, myRot, otherRot);
-            
-            if (!contact.hit || contact.pointCount == 0) continue;
-        
-            uint baseIndex;
-            InterlockedAdd(_ContactCount[0], contact.pointCount, baseIndex);
+            float3 separation = otherPos - myPos;
+            if (dot(separation, separation) > 3.0001f) continue;
+            Contact c = Narrow_Phase(myPos, otherPos, myRot, _Rotations[otherID]);
+            if (!c.hit) continue;
+            for (uint p = 0; p < c.pointCount; p++)
+                AppendContact(myID, otherID, c.points[p].pos, c.normal, c.points[p].penetration);
+        }
+    }
+}
 
-            for (uint p = 0; p < contact.pointCount; p++)
-            {
-                uint index = baseIndex + p;
-
-                if (index >= _MaxContacts) continue;
-
-                ContactConstraint constraint;
-
-                constraint.bodyA = myID;
-                constraint.bodyB = otherID;
-
-                constraint.p = contact.points[p].pos;
-                constraint.normal = contact.normal;
-
-                constraint.penetration = contact.points[p].penetration;
-
-                constraint.accumulatedNormalImpulse = 0.0f;
-
-                _ContactConstraints[index] = constraint;
-            }        
+// All six static container planes, with a contact at each touching cube vertex.
+[numthreads(64,1,1)]
+void BuildFloorContacts(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _Count) return;
+    float3 pos = _Positions[i];
+    float4 q = _Rotations[i];
+    float3 worldMax = _WorldMin + _GridSize * _CellSize;
+    [unroll]
+    for (uint axis = 0; axis < 3; axis++)
+    for (uint side = 0; side < 2; side++)
+    {
+        float3 normal = 0;
+        normal[axis] = side == 0 ? -1.0f : 1.0f;
+        float plane = side == 0 ? _WorldMin[axis] : worldMax[axis];
+        if ((pos[axis] - plane) * normal[axis] < -0.88f) continue;
+        for (uint v = 0; v < 8; v++)
+        {
+            float3 local = float3((v & 1u) ? 0.5f : -0.5f, (v & 2u) ? 0.5f : -0.5f, (v & 4u) ? 0.5f : -0.5f);
+            float3 p = pos + RotateByQuaternion(local, q);
+            float depth = (p[axis] - plane) * normal[axis];
+            if (depth >= -0.01f) AppendContact(i, FLOOR_BODY, p - normal * depth * 0.5f, normal, depth);
         }
     }
 }
@@ -783,224 +660,154 @@ void BuildContacts(uint3 id : SV_DispatchThreadID)
 [numthreads(64,1,1)]
 void ClearContactHeads(uint3 id : SV_DispatchThreadID)
 {
-    uint objectID = id.x;
-    if (objectID >= _Count) return;
+    if (id.x >= _Count) return;
+    _BodyContactHeads[id.x] = FLOOR_BODY;
+    _BodyContactCounts[id.x] = 0;
+}
 
-    _BodyContactHeads[objectID] = 0xFFFFFFFFu;
+[numthreads(1,1,1)]
+void FinalizeContacts(uint3 id : SV_DispatchThreadID)
+{
+    uint groups = max(1u, (min(_ContactCount[0], _MaxContacts) + 63u) / 64u);
+    _DispatchArgs.Store3(0, uint3(min(groups, 65535u), (groups + 65534u) / 65535u, 1));
 }
 
 [numthreads(64,1,1)]
 void BuildContactLinks(uint3 id : SV_DispatchThreadID)
 {
-    uint contactID = id.x;
+    uint i = id.x + id.y * 65535u * 64u;
+    if (i >= min(_ContactCount[0], _MaxContacts)) return;
+    ContactConstraint c = _ContactConstraints[i];
+    uint previous;
+    InterlockedExchange(_BodyContactHeads[c.bodyA], i, previous);
+    _ContactNextA[i] = previous;
+    InterlockedAdd(_BodyContactCounts[c.bodyA], 1);
+    if (c.bodyB == FLOOR_BODY) { _ContactNextB[i] = FLOOR_BODY; return; }
+    InterlockedExchange(_BodyContactHeads[c.bodyB], i, previous);
+    _ContactNextB[i] = previous;
+    InterlockedAdd(_BodyContactCounts[c.bodyB], 1);
+}
 
-    uint contactCount = min(_ContactCount[0], _MaxContacts);
-
-    if (contactID >= contactCount) return;
-
-    ContactConstraint c = _ContactConstraints[contactID];
-
-    uint previousA;
-    InterlockedExchange(_BodyContactHeads[c.bodyA], contactID, previousA);
-
-    _ContactNextA[contactID] = previousA;
-
-    if (c.bodyB == FLOOR_BODY)
-    {
-        _ContactNextB[contactID] = 0xFFFFFFFFu;    
-        return;
-    }
-
-    uint previousB;
-    InterlockedExchange(_BodyContactHeads[c.bodyB], contactID, previousB);
-
-    _ContactNextB[contactID] = previousB;
+float EffectiveMass(float3 rA, float3 rB, float3 axis, bool isStatic)
+{
+    float3 a = cross(rA, axis), b = cross(rB, axis);
+    return 1.0f + 6.0f * dot(a, a) + (isStatic ? 0.0f : 1.0f + 6.0f * dot(b, b));
 }
 
 [numthreads(64,1,1)]
 void SolveContactImpulses(uint3 id : SV_DispatchThreadID)
 {
-    uint contactID = id.x;
-
-    uint contactCount = min(_ContactCount[0], _MaxContacts);
-
-    if (contactID >= contactCount) return;
-
-    ContactConstraint c = _ContactConstraints[contactID];
-
-    bool isFloor = (c.bodyB == FLOOR_BODY);
-
-    uint bodyA = c.bodyA;
-    uint bodyB = c.bodyB;
-
-    float3 posA = _Positions[bodyA];
-    float3 velA = _Velocities[bodyA];
-    float3 angA = _AngularVelocities[bodyA];
-
-    float3 posB = float3(0,0,0);
-    float3 velB = float3(0,0,0);
-    float3 angB = float3(0,0,0);
-
-    if (!isFloor)
+    uint i = id.x + id.y * 65535u * 64u;
+    if (i >= min(_ContactCount[0], _MaxContacts)) return;
+    ContactConstraint c = _ContactConstraints[i];
+    bool isStatic = c.bodyB == FLOOR_BODY;
+    float3 rA = c.p - _Positions[c.bodyA], rB = 0;
+    float3 vA = _Velocities[c.bodyA] + cross(_AngularVelocities[c.bodyA], rA);
+    float3 vB = 0;
+    uint degree = _BodyContactCounts[c.bodyA];
+    if (!isStatic)
     {
-        posB = _Positions[bodyB];
-        velB = _Velocities[bodyB];
-        angB = _AngularVelocities[bodyB];
+        rB = c.p - _Positions[c.bodyB];
+        vB = _Velocities[c.bodyB] + cross(_AngularVelocities[c.bodyB], rB);
+        degree = max(degree, _BodyContactCounts[c.bodyB]);
     }
-
-    float3 rA = c.p - posA;
-    float3 rB = isFloor ? float3(0,0,0) : c.p - posB;
-
-    float invMassA = 1.0f;
-    float invMassB = isFloor ? 0.0f : 1.0f;
-
-    float invInertiaA = 6.0f;
-    float invInertiaB = isFloor ? 0.0f : 6.0f;
-
-    float3 velocityA = velA + cross(angA, rA);
-    float3 velocityB = velB + cross(angB, rB);
-
-    float vn = dot(velocityB - velocityA, c.normal);
-
-    float3 rnA = cross(rA, c.normal);
-    float3 rnB = cross(rB, c.normal);
-
-    float K = invMassA + invMassB + invInertiaA * dot(rnA, rnA) + invInertiaB * dot(rnB, rnB);
-
-    float slop = 0.005f;
-    float beta = 0.05f;
-
-    float penetrationError = max(c.penetration - slop, 0.0f);
-    float bias = beta * penetrationError / max(_DeltaTime, 1e-6f);
-    // bias = min(bias, 0.5f);
-
-    float oldLambda = c.accumulatedNormalImpulse;
-    float deltaLambda = (-vn + bias) / max(K, 1e-6f);
-    float newLambda = max(oldLambda + deltaLambda, 0.0f);
-    
-    float relaxation = 0.25f;
-    newLambda = max(oldLambda + relaxation * deltaLambda, 0.0f);
-
-    deltaLambda = newLambda - oldLambda;
-
-    c.accumulatedNormalImpulse = newLambda;
-    _ContactConstraints[contactID] = c;
-    _ContactDeltaImpulses[contactID] = deltaLambda;
+    float3 relativeVelocity = vB - vA;
+    float vn = dot(relativeVelocity, c.normal);
+    // Degree-dependent under-relaxation bounds simultaneous Jacobi updates in dense manifolds.
+    float relaxation = 1.0f / max(1u, degree);
+    if (_SolverIteration == 0)
+    {
+        float bias = min(2.0f, 0.2f * max(c.penetration - 0.003f, 0) / _DeltaTime);
+        if (c.penetration < 0) bias = c.penetration / _DeltaTime;
+        float bounce = vn < -1.0f && c.penetration >= 0 ? -_Restitution * vn : 0;
+        c.targetVelocity = max(bias, bounce);
+        if (c.penetration < 0) c.targetVelocity = bias;
+    }
+    float oldNormal = c.accumulatedNormalImpulse;
+    float normalImpulse = max(0, oldNormal + relaxation * (c.targetVelocity - vn) / EffectiveMass(rA, rB, c.normal, isStatic));
+    float3 oldTangent = c.accumulatedTangentImpulse;
+    float3 tangentVelocity = relativeVelocity - vn * c.normal;
+    float tangentSpeed = length(tangentVelocity);
+    float3 tangentImpulse = oldTangent;
+    if (tangentSpeed > 1e-6f)
+    {
+        float3 tangent = tangentVelocity / tangentSpeed;
+        tangentImpulse -= relaxation * tangentVelocity / EffectiveMass(rA, rB, tangent, isStatic);
+    }
+    float frictionLimit = _Friction * normalImpulse;
+    tangentImpulse *= min(1.0f, frictionLimit / max(length(tangentImpulse), 1e-8f));
+    c.accumulatedNormalImpulse = normalImpulse;
+    c.accumulatedTangentImpulse = tangentImpulse;
+    _ContactConstraints[i] = c;
+    _ContactDeltaImpulses[i] = (normalImpulse - oldNormal) * c.normal + tangentImpulse - oldTangent;
 }
 
 [numthreads(64,1,1)]
 void ApplyContactImpulses(uint3 id : SV_DispatchThreadID)
 {
-    uint bodyID = id.x;
-
-    if (bodyID >= _Count) return;
-
-    float3 pos = _Positions[bodyID];
-    float3 velocity = _Velocities[bodyID];
-    float3 angularVelocity = _AngularVelocities[bodyID];
-
-    float3 deltaVelocity = float3(0,0,0);
-    float3 deltaAngularVelocity = float3(0,0,0);
-
-    uint contactID = _BodyContactHeads[bodyID];
-
-    while (contactID != 0xFFFFFFFFu)
+    uint body = id.x;
+    if (body >= _Count) return;
+    float3 deltaV = 0, deltaW = 0;
+    uint i = _BodyContactHeads[body];
+    while (i != FLOOR_BODY)
     {
-        ContactConstraint c = _ContactConstraints[contactID];
-
-        float deltaLambda = _ContactDeltaImpulses[contactID];
-
-        float3 impulse = deltaLambda * c.normal;
-
-        bool isA = (c.bodyA == bodyID);
-
-        if (isA) impulse = -impulse;
-
-        float3 r = c.p - pos;
-
-        deltaVelocity += impulse;
-        deltaAngularVelocity += 6.0f * cross(r, impulse);
-
-        contactID = isA ? _ContactNextA[contactID] : _ContactNextB[contactID];
+        ContactConstraint c = _ContactConstraints[i];
+        bool isA = c.bodyA == body;
+        float3 impulse = _ContactDeltaImpulses[i] * (isA ? -1.0f : 1.0f);
+        deltaV += impulse;
+        deltaW += 6.0f * cross(c.p - _Positions[body], impulse);
+        i = isA ? _ContactNextA[i] : _ContactNextB[i];
     }
-
-    _NextVelocities[bodyID] = velocity + deltaVelocity;
-    _NextAngularVelocities[bodyID] = angularVelocity + deltaAngularVelocity;
+    _NextVelocities[body] = _Velocities[body] + deltaV;
+    _NextAngularVelocities[body] = _AngularVelocities[body] + deltaW;
 }
-
-[numthreads(64, 1, 1)]
-void BuildFloorContacts(uint3 id : SV_DispatchThreadID)
-{
-    uint objectID = id.x;
-    if (objectID >= _Count) return;
-
-    float3 pos = _Positions[objectID];
-    float4 q = _Rotations[objectID];
-
-    float floorY = _WorldMin.y;
-
-    float3 sumPoint = float3(0,0,0);
-    float maxPenetration = 0.0f;
-    uint hitCount = 0;
-
-    [unroll]
-    for (uint i = 0; i<8; i++)
-    {
-        float3 localVertex = float3(
-            (i & 1u) ? 0.5f : -0.5f,
-            (i & 2u) ? 0.5f : -0.5f,
-            (i & 4u) ? 0.5f : -0.5f
-        );
-
-        float3 r = RotateByQuaternion(localVertex, q);
-        float3 worldVertex = pos + r;
-
-        float penetration = floorY - worldVertex.y;
-
-        if (penetration >= -0.005f)
-        {
-            sumPoint += worldVertex;
-            hitCount++;
-
-            maxPenetration = max(maxPenetration, penetration);
-        }
-    }
-
-    if (hitCount == 0) return;
-
-    uint contactID; 
-    InterlockedAdd(_ContactCount[0], 1, contactID);
-
-    if (contactID >= _MaxContacts) return;
-
-    ContactConstraint c;
-
-    c.bodyA = objectID;
-    c.bodyB = FLOOR_BODY;
-
-    c.p = sumPoint / hitCount;
-    c.normal = float3(0.0f, -1.0f, 0.0f);
-    c.penetration = maxPenetration;
-    c.accumulatedNormalImpulse = 0.0f;
-
-    _ContactConstraints[contactID] = c;
-}
-
 
 [numthreads(64,1,1)]
-void main (uint3 id : SV_DispatchThreadID)
-{    
-    uint objectID = id.x;
-
-    if (objectID >= _Count) return;
-
-    // Rigidbody
-    // _Positions[objectID] += _Velocities[objectID] * _DeltaTime;
-    float3 pos = _Positions[objectID];
-    pos += _Velocities[objectID] * _DeltaTime;
-    _Positions[objectID] = pos;
-
-    float4 rotation = _Rotations[objectID];
-    float3 angularVelocity = _AngularVelocities[objectID];
-    _Rotations[objectID] = IntegrateRotation(rotation, angularVelocity, _DeltaTime);
+void main(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _Count) return;
+    float3 v = _Velocities[i], w = _AngularVelocities[i] / (1 + _AngularDamping * _DeltaTime);
+    // This is a discrete solver, not CCD. Bound per-step displacement and spin.
+    v *= min(1.0f, 30.0f / max(length(v), 1e-6f));
+    w *= min(1.0f, 20.0f / max(length(w), 1e-6f));
+    float4 q = IntegrateRotation(_Rotations[i], w, _DeltaTime);
+    // Split positional stabilization: correct overlap without injecting kinetic energy.
+    // Constraints use the pre-integration snapshot; each thread writes only its own body.
+    float3 correction = 0;
+    uint contactID = _ReadHeads[i], pointCount = 0;
+    while (contactID != FLOOR_BODY)
+    {
+        ContactConstraint c = _ReadContacts[contactID];
+        bool isA = c.bodyA == i;
+        float massShare = c.bodyB == FLOOR_BODY ? 1.0f : 0.5f;
+        correction += (isA ? -c.normal : c.normal) * max(c.penetration - 0.003f, 0) * massShare;
+        pointCount++;
+        contactID = isA ? _ReadNextA[contactID] : _ReadNextB[contactID];
+    }
+    correction *= 0.8f / max(1u, pointCount);
+    correction *= min(1.0f, 0.2f / max(length(correction), 1e-6f));
+    float3 p = _Positions[i] + v * _DeltaTime + correction;
+    if (!all(isfinite(p)) || !all(isfinite(q)) || !all(isfinite(v)) || !all(isfinite(w)))
+    {
+        InterlockedAdd(_ContactCount[3], 1);
+        p = float3(100, 100, 100); q = float4(0,0,0,1); v = 0; w = 0;
+    }
+    float3 extents = 0.5f * (abs(RotateByQuaternion(float3(1,0,0), q)) +
+        abs(RotateByQuaternion(float3(0,1,0), q)) + abs(RotateByQuaternion(float3(0,0,1), q)));
+    float3 lo = _WorldMin + extents, hi = _WorldMin + _GridSize * _CellSize - extents;
+    // Safety projection keeps bodies in the grid even on capacity overflow/large impact.
+    [unroll]
+    for (uint axis = 0; axis < 3; axis++)
+    {
+        if (p[axis] < lo[axis] || p[axis] > hi[axis])
+        {
+            InterlockedAdd(_ContactCount[2], 1);
+            if ((p[axis] < lo[axis] && v[axis] < 0) || (p[axis] > hi[axis] && v[axis] > 0))
+                v[axis] *= -_Restitution;
+            p[axis] = clamp(p[axis], lo[axis], hi[axis]);
+        }
+    }
+    _Positions[i] = p; _Rotations[i] = q;
+    _NextVelocities[i] = v; _NextAngularVelocities[i] = w;
 }

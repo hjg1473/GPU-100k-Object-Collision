@@ -253,8 +253,8 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 330585543}
   serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 1, z: -10}
+  m_LocalRotation: {x: 0.27162668, y: 0, z: 0, w: 0.9624027}
+  m_LocalPosition: {x: 100, y: 95, z: -50}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -526,6 +526,64 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &940986473
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 940986475}
+  - component: {fileID: 940986474}
+  m_Layer: 0
+  m_Name: 7_Cube
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &940986474
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 940986473}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 9b8e1d3394bd510409b07e8287251473, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::GPUCube_gpt
+  computeShader: {fileID: 7200000, guid: 8c2b1b88914a0a846b371833a1c91a04, type: 3}
+  mat: {fileID: 2100000, guid: b1ad7117913c8e64394a0f7c041bf64c, type: 2}
+  mesh: {fileID: 10202, guid: 0000000000000000e000000000000000, type: 0}
+  count: 10000
+  maxContacts: 2400000
+  solverIterations: 24
+  simulationHz: 120
+  maxSubsteps: 4
+  friction: 0.6
+  restitution: 0.1
+  linearDamping: 0.05
+  angularDamping: 0.1
+  spawnLayers: 8
+  diagnostics: 1
+--- !u!4 &940986475
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 940986473}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: -0, y: -0, z: -0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &952434285
 GameObject:
   m_ObjectHideFlags: 0
@@ -542,7 +600,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &952434287
 Transform:
   m_ObjectHideFlags: 0
@@ -573,7 +631,7 @@ MonoBehaviour:
   computeShader: {fileID: 7200000, guid: 43395b16ecd207045ba994af622d34ca, type: 3}
   mat: {fileID: 2100000, guid: d43dedb5ceb659d4283fc4d73d6cadc2, type: 2}
   mesh: {fileID: 10202, guid: 0000000000000000e000000000000000, type: 0}
-  count: 64
+  count: 1000000
   maxContacts: 4000000
   solverIterations: 4
 --- !u!1 &990036868
@@ -732,3 +790,4 @@ SceneRoots:
   - {fileID: 308240537}
   - {fileID: 1481381840}
   - {fileID: 952434287}
+  - {fileID: 940986475}

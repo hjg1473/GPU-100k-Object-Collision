@@ -374,14 +374,17 @@ public class GPUCube_rigidbody : MonoBehaviour
     {
         Vector3[] positions = new Vector3[count];
 
+        int width = Mathf.Clamp(Mathf.CeilToInt(Mathf.Sqrt(count / 8.0f)), 1, 170);
+
         for (int i=0; i < count; i++)
         {
-            int x = i % 100;
-            int y = (i / 100) % 100;
-            int z = i / 10000;
+            float margin = (GridSize * CellSize - (width - 1) * 1.15f) * 0.5f;
+            int x = i % width;
+            int y = (i / width) % width;
+            int z = i / (width * width);
 
-            // positions[i] = new Vector3(x * 1.2f, y * 1.2f, z * 1.2f);
-            positions[i] = new Vector3(10f, i * 5f + 1, 10f);
+            positions[i] = new Vector3(0, 0, 50) + new Vector3(margin + x * 1.15f, 2.0f + y * 1.15f, margin + z * 1.15f);
+            // positions[i] = new Vector3(10f, i * 5f + 1, 10f);
         }
         
         positionBuffer.SetData(positions);

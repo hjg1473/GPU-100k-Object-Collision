@@ -14,6 +14,7 @@ Shader "Custom/7_Cube"
         {
             HLSLPROGRAM
 
+            #pragma target 4.5
             #pragma vertex vert
             #pragma fragment frag
 
@@ -25,6 +26,7 @@ Shader "Custom/7_Cube"
             struct Attributes
             {
                 float4 positionOS : POSITION;
+                float3 normalOS : NORMAL;
                 float2 uv : TEXCOORD0;
             };
 
@@ -46,7 +48,7 @@ Shader "Custom/7_Cube"
             StructuredBuffer<float3> _Positions;
             StructuredBuffer<float4> _Rotations;
 
-            StructuredBuffer<uint> _Collisions;
+
 
             float Random(uint seed)
             {
@@ -74,9 +76,11 @@ Shader "Custom/7_Cube"
                 
                 pos += _Positions[instanceID];
 
-                OUT.positionHCS = TransformObjectToHClip(pos);
+                OUT.positionHCS = TransformWorldToHClip(pos);
                 OUT.uv = TRANSFORM_TEX(IN.uv, _BaseMap);
-                OUT.color = float3(Random(instanceID + 0), Random(instanceID + 1), Random(instanceID + 2));
+                float3 normalWS = RotateByQuaternion(IN.normalOS, rot);
+                float lighting = 0.35 + 0.65 * saturate(dot(normalWS, normalize(float3(0.4, 0.8, -0.3))));
+                OUT.color = lerp(0.25, 1.0, float3(Random(instanceID + 0), Random(instanceID + 1), Random(instanceID + 2))) * lighting;
 
                 return OUT;
             }

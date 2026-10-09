@@ -1,513 +1,295 @@
+using System;
+using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 
+/// <summary>GPU-only, unit-mass, unit-size oriented boxes. No per-cube GameObjects/PhysX bodies.</summary>
 public class GPUCube_gpt : MonoBehaviour
 {
-
     public ComputeShader computeShader;
     public Material mat;
     public Mesh mesh;
-    public uint count = 1000000;
-    [SerializeField] int maxContacts = 4000000;
-    [SerializeField] int solverIterations = 4;
+    public uint count = 100000;
+    [SerializeField, Min(1)] int maxContacts = 2400000;
+    [SerializeField, Range(1, 64)] int solverIterations = 24;
+    [SerializeField, Range(30, 240)] int simulationHz = 120;
+    [SerializeField, Range(1, 8)] int maxSubsteps = 4;
+    [SerializeField, Range(0, 1)] float friction = 0.6f;
+    [SerializeField, Range(0, 1)] float restitution = 0.1f;
+    [SerializeField, Min(0)] float linearDamping = 0.05f;
+    [SerializeField, Min(0)] float angularDamping = 0.1f;
+    [SerializeField, Range(1, 64)] int spawnLayers = 8;
+    [SerializeField] bool diagnostics = true;
 
-    
-    int mainKernel;
-    int clearCellCountsKernel;    
-    int clearCellWriteCountersKernel;    
-    int updateCellCountsKernel;
-    int updateObjectIDsKernel;
-    int updateCellStartsKernel;
-    int inclusiveToExclusiveKernel;
-    int applyGravityKernel;
-    int clearContactHeadsKernel;
-    int buildContactLinksKernel;
-    int solveContactImpulsesKernel;
-    int applyContactImpulsesKernel;
-    int buildContactsKernel;
-    int buildFloorContactsKernel;
+    // These are sampled asynchronously, once per second; they describe one substep.
+    public uint RequestedContacts { get; private set; }
+    public uint PeakCellOccupancy { get; private set; }
+    public uint InvalidBodies { get; private set; }
+    public bool ContactOverflow => RequestedContacts > capacity;
+    public long AllocatedBytes { get; private set; }
+    public double SimulatedSeconds { get; private set; }
+    public float DroppedSimulationSeconds { get; private set; }
 
-    GraphicsBuffer commandBuffer;
-    GraphicsBuffer.IndirectDrawIndexedArgs[] commandData;
-    GraphicsBuffer positionBuffer;
-    GraphicsBuffer collisionBuffer;
-    
-    GraphicsBuffer cellCountBuffer; 
-    GraphicsBuffer objectIDBuffer;
-    GraphicsBuffer cellStartBuffer;
-    GraphicsBuffer cellWriteCounterBuffer;
-    GraphicsBuffer prefixInputBuffer;
-    GraphicsBuffer prefixOutputBuffer;
-
-    GraphicsBuffer velocityBuffer;
-    GraphicsBuffer newVelocityBuffer;
-
-    GraphicsBuffer rotationBuffer;
-    GraphicsBuffer angularVelocityBuffer;
-    GraphicsBuffer newAngularVelocityBuffer;
-
-    
-    GraphicsBuffer contactConstraintsBuffer;
-    GraphicsBuffer contactCountBuffer;
-    GraphicsBuffer contactDeltaBuffer;
-    GraphicsBuffer bodyContactHeadsBuffer;
-    GraphicsBuffer contactNextABuffer;
-    GraphicsBuffer contactNextBBuffer;
-    
-
-    // const int WorldMin = 25;
-    const int commandCount = 1;
     const int GridSize = 100;
-    const float CellSize = 2;
-    const int CellRange = GridSize * GridSize * GridSize;
-    readonly uint[] zeroContactCount = { 0 };
+    const float CellSize = 2f; // >= unit cube's circumscribed diameter sqrt(3).
+    const int Cells = GridSize * GridSize * GridSize;
+    const int Threads = 64;
+    const int ScanThreads = 256;
+    const float WorldSize = GridSize * CellSize;
+    readonly List<GraphicsBuffer> buffers = new List<GraphicsBuffer>();
+    readonly List<GraphicsBuffer> scanSums = new List<GraphicsBuffer>();
+    readonly List<GraphicsBuffer> scanOffsets = new List<GraphicsBuffer>();
+    readonly List<int> scanLengths = new List<int>();
+    ComputeShader simulation;
+    Material renderingMaterial;
+    GraphicsBuffer positions, rotations, velocities, nextVelocities, angularVelocities, nextAngularVelocities;
+    GraphicsBuffer cellCounts, cellStarts, cellWrites, objectIDs;
+    GraphicsBuffer contacts, contactCount, deltas, heads, degrees, nextA, nextB, dispatchArgs, drawArgs;
+    int init, clearGrid, countCells, scatter, scan, addOffsets, resetCounters;
+    int gravity, boundaryContacts, buildContacts, clearHeads, linkContacts, finalizeContacts, solve, apply, integrate;
+    int bodyCount, capacity, generation;
+    float accumulator, nextDiagnostics;
+    bool initialized, readbackPending, overflowReported;
 
-
-    void Start()
+    GraphicsBuffer Allocate(int length, int stride, GraphicsBuffer.Target target = GraphicsBuffer.Target.Structured)
     {
-        CreateBuffer();
-        
-
-        FindKernel();
-
-        InitPositions();
-        InitRotations();
-        InitVelocities();
-        InitAngularVelocities();
-
-        BindBuffer();
-        BindUniformGridBuffer();
-        BindContactBuffers();
+        long bytes = (long)length * stride;
+        if (bytes > SystemInfo.maxGraphicsBufferSize)
+            throw new InvalidOperationException($"GPU buffer requires {bytes:N0} bytes, above this device's limit.");
+        var buffer = new GraphicsBuffer(target, length, stride);
+        buffers.Add(buffer);
+        AllocatedBytes += bytes;
+        return buffer;
     }
 
-    void CreateBuffer()
+    void OnEnable()
     {
-        commandBuffer = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, commandCount, GraphicsBuffer.IndirectDrawIndexedArgs.size);
-        commandData = new GraphicsBuffer.IndirectDrawIndexedArgs[commandCount];
-        commandData[0].indexCountPerInstance = mesh.GetIndexCount(0);
-        commandData[0].instanceCount = count;
-        commandBuffer.SetData(commandData); 
+        try
+        {
+            if (!computeShader || !mat || !mesh)
+                throw new InvalidOperationException("Assign 7_Compute, 7_Cube material and a centered unit cube mesh.");
+            if (!SystemInfo.supportsComputeShaders || !SystemInfo.supportsInstancing)
+                throw new NotSupportedException("Compute shaders and indirect instancing are required.");
+            if (count == 0 || count > 1000000 || maxContacts < 1 || maxContacts > 32000000)
+                throw new ArgumentOutOfRangeException("Use 1..1,000,000 bodies and 1..32,000,000 contacts.");
+            if ((mesh.bounds.size - Vector3.one).sqrMagnitude > 0.0001f || mesh.bounds.center.sqrMagnitude > 0.0001f)
+                throw new InvalidOperationException("Physics uses centered 1 x 1 x 1 cubes; the mesh bounds must match.");
+            bodyCount = (int)count;
+            capacity = maxContacts;
+            simulation = Instantiate(computeShader); // Independent bindings for multiple simulators.
+            renderingMaterial = new Material(mat) { enableInstancing = true };
+            init = Kernel("InitializeBodies"); clearGrid = Kernel("ClearGrid");
+            countCells = Kernel("UpdateCellCounts"); scatter = Kernel("UpdateObjectIDs");
+            scan = Kernel("ScanBlocks"); addOffsets = Kernel("AddBlockOffsets");
+            resetCounters = Kernel("ResetCounters"); gravity = Kernel("ApplyGravity");
+            boundaryContacts = Kernel("BuildFloorContacts"); buildContacts = Kernel("BuildContacts");
+            clearHeads = Kernel("ClearContactHeads"); linkContacts = Kernel("BuildContactLinks");
+            finalizeContacts = Kernel("FinalizeContacts"); solve = Kernel("SolveContactImpulses");
+            apply = Kernel("ApplyContactImpulses"); integrate = Kernel("main");
 
-        positionBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, (int)count, sizeof(float) * 3);
-        velocityBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, (int)count, sizeof(float) * 3);
-        newVelocityBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, (int)count, sizeof(float) * 3);
-
-        rotationBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, (int)count, sizeof(float) * 4);
-        angularVelocityBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, (int)count, sizeof(float) * 3);
-        newAngularVelocityBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, (int)count, sizeof(float) * 3);
-
-        collisionBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, (int)count, sizeof(uint));
-
-        cellCountBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, CellRange, sizeof(uint));
-        objectIDBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, (int)count, sizeof(uint));
-        cellStartBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, CellRange, sizeof(uint));
-        cellWriteCounterBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, CellRange, sizeof(uint));
-        prefixInputBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, CellRange, sizeof(uint));
-        prefixOutputBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, CellRange, sizeof(uint));
-
-        contactConstraintsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, maxContacts, 40);
-        contactCountBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, sizeof(uint));
-        contactDeltaBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, maxContacts, sizeof(float));
-        bodyContactHeadsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, (int)count, sizeof(uint));
-        contactNextABuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, maxContacts, sizeof(uint));
-        contactNextBBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, maxContacts, sizeof(uint));
+            positions = Allocate(bodyCount, 12); rotations = Allocate(bodyCount, 16);
+            velocities = Allocate(bodyCount, 12); nextVelocities = Allocate(bodyCount, 12);
+            angularVelocities = Allocate(bodyCount, 12); nextAngularVelocities = Allocate(bodyCount, 12);
+            cellCounts = Allocate(Cells, 4); cellStarts = Allocate(Cells, 4); cellWrites = Allocate(Cells, 4);
+            objectIDs = Allocate(bodyCount, 4);
+            // HLSL ContactConstraint: 2 uint + 2 float3 + 2 float + float3 + float = 56 bytes.
+            contacts = Allocate(capacity, 56); deltas = Allocate(capacity, 12);
+            nextA = Allocate(capacity, 4); nextB = Allocate(capacity, 4);
+            heads = Allocate(bodyCount, 4); degrees = Allocate(bodyCount, 4);
+            contactCount = Allocate(4, 4);
+            dispatchArgs = Allocate(3, 4, GraphicsBuffer.Target.IndirectArguments | GraphicsBuffer.Target.Raw);
+            drawArgs = Allocate(1, GraphicsBuffer.IndirectDrawIndexedArgs.size, GraphicsBuffer.Target.IndirectArguments);
+            drawArgs.SetData(new[] { new GraphicsBuffer.IndirectDrawIndexedArgs {
+                indexCountPerInstance = mesh.GetIndexCount(0), instanceCount = (uint)bodyCount,
+                startIndex = mesh.GetIndexStart(0), baseVertexIndex = (uint)mesh.GetBaseVertex(0)
+            }});
+            for (int length = Cells; ; length = DivideUp(length, ScanThreads))
+            {
+                int blocks = DivideUp(length, ScanThreads);
+                scanLengths.Add(length);
+                scanSums.Add(Allocate(blocks, 4));
+                scanOffsets.Add(Allocate(blocks, 4));
+                if (blocks == 1) break;
+            }
+            simulation.SetInt("_Count", bodyCount);
+            simulation.SetInt("_MaxContacts", capacity);
+            simulation.SetInt("_GridSize", GridSize);
+            simulation.SetFloat("_CellSize", CellSize);
+            simulation.SetVector("_WorldMin", Vector3.zero);
+            int width = Mathf.Clamp(Mathf.CeilToInt(Mathf.Sqrt(bodyCount / (float)Mathf.Max(1, spawnLayers))), 1, 170);
+            simulation.SetInt("_SpawnWidth", width);
+            BindStaticBuffers();
+            simulation.Dispatch(resetCounters, 1, 1, 1);
+            DispatchBodies(init);
+            renderingMaterial.SetBuffer("_Positions", positions);
+            renderingMaterial.SetBuffer("_Rotations", rotations);
+            initialized = true;
+            Debug.Log($"GPU cubes: {bodyCount:N0} bodies, {capacity:N0} contact capacity, {AllocatedBytes / 1048576f:F1} MiB buffers.", this);
+        }
+        catch (Exception e)
+        {
+            Debug.LogException(e, this);
+            Release();
+            enabled = false;
+        }
     }
 
-    void FindKernel()
+    int Kernel(string name) => simulation.FindKernel(name);
+    static int DivideUp(int n, int divisor) => (n + divisor - 1) / divisor;
+    void Bind(int kernel, string name, GraphicsBuffer buffer) => simulation.SetBuffer(kernel, name, buffer);
+    void DispatchBodies(int kernel) => simulation.Dispatch(kernel, DivideUp(bodyCount, Threads), 1, 1);
+
+    void BindStaticBuffers()
     {
-        mainKernel = computeShader.FindKernel("main");
-
-        clearCellCountsKernel = computeShader.FindKernel("ClearCellCounts");
-        clearCellWriteCountersKernel = computeShader.FindKernel("ClearCellWriteCounters");
-
-        updateCellCountsKernel = computeShader.FindKernel("UpdateCellCounts");
-        updateObjectIDsKernel = computeShader.FindKernel("UpdateObjectIDs");
-        updateCellStartsKernel = computeShader.FindKernel("UpdateCellStarts");
-        inclusiveToExclusiveKernel = computeShader.FindKernel("InclusiveToExclusive");
-
-        applyGravityKernel = computeShader.FindKernel("ApplyGravity");
-        
-        clearContactHeadsKernel = computeShader.FindKernel("ClearContactHeads");
-        buildContactLinksKernel = computeShader.FindKernel("BuildContactLinks");
-        solveContactImpulsesKernel = computeShader.FindKernel("SolveContactImpulses");
-        applyContactImpulsesKernel = computeShader.FindKernel("ApplyContactImpulses");
-        buildContactsKernel = computeShader.FindKernel("BuildContacts");
-        buildFloorContactsKernel = computeShader.FindKernel("BuildFloorContacts");
-    }
-
-    void BindBuffer()
-    {
-        computeShader.SetInt("_Count", (int)count);
-        
-        computeShader.SetInt("_GridSize", GridSize);
-        computeShader.SetFloat("_CellSize", CellSize);
-
-        computeShader.SetVector("_WorldMin", new Vector3(0,0,0));
-
-        computeShader.SetBuffer(mainKernel, "_Positions", positionBuffer);
-        computeShader.SetBuffer(mainKernel, "_Rotations", rotationBuffer);
-
-        computeShader.SetBuffer(applyGravityKernel, "_Positions", positionBuffer);
-        // computeShader.SetBuffer(mainKernel, "_Collisions", collisionBuffer);
-        // computeShader.SetBuffer(mainKernel, "_CellCounts", cellCountBuffer);
-        // computeShader.SetBuffer(mainKernel, "_CellStarts", cellStartBuffer);
-        // computeShader.SetBuffer(mainKernel, "_ObjectIDs", objectIDBuffer);
-
-        mat.SetBuffer("_Positions", positionBuffer);
-        mat.SetBuffer("_Rotations", rotationBuffer);
-        mat.SetBuffer("_Collisions", collisionBuffer);
-    }
-
-    void BindUniformGridBuffer()
-    {
-        computeShader.SetBuffer(clearCellCountsKernel, "_CellCounts", cellCountBuffer);
-        computeShader.SetBuffer(clearCellWriteCountersKernel, "_CellWriteCounters", cellWriteCounterBuffer);
-
-        computeShader.SetBuffer(updateCellCountsKernel, "_Positions", positionBuffer);
-        computeShader.SetBuffer(updateCellCountsKernel, "_CellCounts", cellCountBuffer);
-
-        computeShader.SetBuffer(updateObjectIDsKernel, "_Positions", positionBuffer);
-        computeShader.SetBuffer(updateObjectIDsKernel, "_CellCounts", cellCountBuffer);
-        computeShader.SetBuffer(updateObjectIDsKernel, "_ObjectIDs", objectIDBuffer);
-        computeShader.SetBuffer(updateObjectIDsKernel, "_CellStarts", cellStartBuffer);
-        computeShader.SetBuffer(updateObjectIDsKernel, "_CellWriteCounters", cellWriteCounterBuffer);
-    }
-
-    void BindContactBuffers()
-    {
-        // ClearContactHeads
-        computeShader.SetBuffer(clearContactHeadsKernel, "_BodyContactHeads", bodyContactHeadsBuffer);
-
-        // BuildFloorContacts
-        computeShader.SetBuffer(buildFloorContactsKernel, "_Positions", positionBuffer);
-        computeShader.SetBuffer(buildFloorContactsKernel, "_Rotations", rotationBuffer);
-        computeShader.SetBuffer(buildFloorContactsKernel, "_ContactConstraints", contactConstraintsBuffer);
-        computeShader.SetBuffer(buildFloorContactsKernel, "_ContactCount", contactCountBuffer);
-
-        // BuildContacts
-        computeShader.SetBuffer(buildContactsKernel, "_Positions", positionBuffer);
-        computeShader.SetBuffer(buildContactsKernel, "_Rotations", rotationBuffer);
-        computeShader.SetBuffer(buildContactsKernel, "_CellCounts", cellCountBuffer);
-        computeShader.SetBuffer(buildContactsKernel, "_CellStarts", cellStartBuffer);
-        computeShader.SetBuffer(buildContactsKernel, "_ObjectIDs", objectIDBuffer);
-        computeShader.SetBuffer(buildContactsKernel, "_ContactConstraints", contactConstraintsBuffer);
-        computeShader.SetBuffer(buildContactsKernel, "_ContactCount", contactCountBuffer);
-
-        // BuildContactLinks
-        computeShader.SetBuffer(buildContactLinksKernel, "_ContactConstraints", contactConstraintsBuffer);
-        computeShader.SetBuffer(buildContactLinksKernel, "_ContactCount", contactCountBuffer);
-        computeShader.SetBuffer(buildContactLinksKernel, "_BodyContactHeads", bodyContactHeadsBuffer);
-        computeShader.SetBuffer(buildContactLinksKernel, "_ContactNextA", contactNextABuffer);
-        computeShader.SetBuffer(buildContactLinksKernel, "_ContactNextB", contactNextBBuffer);
-
-        // SolveContactImpulses
-        computeShader.SetBuffer(solveContactImpulsesKernel, "_ContactConstraints", contactConstraintsBuffer);
-        computeShader.SetBuffer(solveContactImpulsesKernel, "_ContactCount", contactCountBuffer);
-        computeShader.SetBuffer(solveContactImpulsesKernel, "_ContactDeltaImpulses", contactDeltaBuffer);
-        computeShader.SetBuffer(solveContactImpulsesKernel, "_Positions", positionBuffer);
-
-        // ApplyContactImpulses
-        computeShader.SetBuffer(applyContactImpulsesKernel, "_ContactConstraints", contactConstraintsBuffer);
-        computeShader.SetBuffer(applyContactImpulsesKernel, "_ContactDeltaImpulses", contactDeltaBuffer);
-        computeShader.SetBuffer(applyContactImpulsesKernel, "_BodyContactHeads", bodyContactHeadsBuffer);
-        computeShader.SetBuffer(applyContactImpulsesKernel, "_ContactNextA", contactNextABuffer);
-        computeShader.SetBuffer(applyContactImpulsesKernel, "_ContactNextB", contactNextBBuffer);
-        computeShader.SetBuffer(applyContactImpulsesKernel, "_Positions", positionBuffer);
-
-        computeShader.SetInt("_MaxContacts", maxContacts);
-    }
-
-    void OnDestroy()
-    {
-        commandBuffer?.Release();
-        commandBuffer = null;
-
-        positionBuffer?.Release();
-        positionBuffer = null;
-
-        collisionBuffer?.Release();
-        collisionBuffer = null;
-        
-        cellCountBuffer?.Release();
-        cellCountBuffer = null;
-        
-        objectIDBuffer?.Release();
-        objectIDBuffer = null;
-        
-        cellStartBuffer?.Release();
-        cellStartBuffer = null;
-        
-        cellWriteCounterBuffer?.Release();
-        cellWriteCounterBuffer = null;
-
-        prefixInputBuffer?.Release();
-        prefixInputBuffer = null;
-
-        prefixOutputBuffer?.Release();
-        prefixOutputBuffer = null;
-
-        velocityBuffer?.Release();
-        velocityBuffer = null;
-
-        newVelocityBuffer?.Release();
-        newVelocityBuffer = null;
-        
-        rotationBuffer?.Release();
-        rotationBuffer = null;
-
-        angularVelocityBuffer?.Release();
-        angularVelocityBuffer = null;
-
-        newAngularVelocityBuffer?.Release();
-        newAngularVelocityBuffer = null;
-
-        
-        contactConstraintsBuffer?.Release();
-        contactConstraintsBuffer = null;
-        
-        contactCountBuffer?.Release();
-        contactCountBuffer = null;
-        
-        contactDeltaBuffer?.Release();
-        contactDeltaBuffer = null;
-        
-        bodyContactHeadsBuffer?.Release();
-        bodyContactHeadsBuffer = null;
-
-        contactNextABuffer?.Release();
-        contactNextABuffer = null;
-
-        contactNextBBuffer?.Release();
-        contactNextBBuffer = null;
+        foreach (int k in new[] { init, countCells, scatter, gravity, boundaryContacts, buildContacts, solve, apply, integrate })
+            Bind(k, "_Positions", positions);
+        foreach (int k in new[] { init, boundaryContacts, buildContacts, integrate }) Bind(k, "_Rotations", rotations);
+        Bind(init, "_NextVelocities", velocities); Bind(init, "_NextAngularVelocities", angularVelocities);
+        foreach (int k in new[] { clearGrid, countCells, buildContacts }) Bind(k, "_CellCounts", cellCounts);
+        foreach (int k in new[] { clearGrid, scatter }) Bind(k, "_CellWriteCounters", cellWrites);
+        foreach (int k in new[] { scatter, buildContacts })
+        {
+            Bind(k, "_CellStarts", cellStarts); Bind(k, "_ObjectIDs", objectIDs);
+        }
+        foreach (int k in new[] { boundaryContacts, buildContacts, linkContacts, solve, apply })
+            Bind(k, "_ContactConstraints", contacts);
+        foreach (int k in new[] { resetCounters, countCells, boundaryContacts, buildContacts, linkContacts, finalizeContacts, solve, integrate })
+            Bind(k, "_ContactCount", contactCount);
+        foreach (int k in new[] { clearHeads, linkContacts, apply }) Bind(k, "_BodyContactHeads", heads);
+        foreach (int k in new[] { clearHeads, linkContacts, solve }) Bind(k, "_BodyContactCounts", degrees);
+        foreach (int k in new[] { linkContacts, apply })
+        {
+            Bind(k, "_ContactNextA", nextA); Bind(k, "_ContactNextB", nextB);
+        }
+        Bind(integrate, "_ReadContacts", contacts); Bind(integrate, "_ReadHeads", heads);
+        Bind(integrate, "_ReadNextA", nextA); Bind(integrate, "_ReadNextB", nextB);
+        Bind(finalizeContacts, "_DispatchArgs", dispatchArgs);
+        Bind(solve, "_ContactDeltaImpulses", deltas); Bind(apply, "_ContactDeltaImpulses", deltas);
     }
 
     void Update()
     {
-        UpdateSimulationParameters();
-
-        BuildUniformGrid();
-        ApplyGravity();
-        SolveContacts();
-        IntegrateBodies();
-        RenderObjects();
-    }
-    void UpdateSimulationParameters()
-    {
-        computeShader.SetFloat("_DeltaTime", Time.deltaTime);
-    }
-    
-    void BuildUniformGrid()
-    {
-        computeShader.Dispatch(clearCellCountsKernel, Mathf.CeilToInt(CellRange / 64.0f), 1, 1);
-        computeShader.Dispatch(clearCellWriteCountersKernel, Mathf.CeilToInt(CellRange / 64.0f), 1, 1);
-        computeShader.Dispatch(updateCellCountsKernel, Mathf.CeilToInt(count / 64.0f), 1, 1);
-        
-        Hillis_Steele();
-
-        computeShader.Dispatch(updateObjectIDsKernel, Mathf.CeilToInt(count / 64.0f), 1, 1);
-
-    }
-
-    void SolveContacts()
-    {
-        BuildContactConstraints();
-        BuildContactLinks();
-        RunJacobiIterations();
-    }
-
-    void IntegrateBodies()
-    {
-        computeShader.SetBuffer(mainKernel, "_Velocities", velocityBuffer);
-        computeShader.SetBuffer(mainKernel, "_AngularVelocities", angularVelocityBuffer);
-        computeShader.Dispatch(mainKernel, Mathf.CeilToInt(count / 64.0f), 1, 1);
-    }
-
-    void RenderObjects()
-    {
-        RenderParams rp = new RenderParams(mat);
-        rp.worldBounds = new Bounds(Vector3.zero, 10000*Vector3.one);        
-        Graphics.RenderMeshIndirect(rp, mesh, commandBuffer, commandCount);
-    }
-
-    void Hillis_Steele()
-    {
-        GraphicsBuffer input;
-        GraphicsBuffer output;
-
-        computeShader.SetInt("_Offset", 1);
-
-        computeShader.SetBuffer(updateCellStartsKernel, "_PrefixInput", cellCountBuffer);
-        computeShader.SetBuffer(updateCellStartsKernel, "_PrefixOutput", prefixInputBuffer);
-
-        computeShader.Dispatch(updateCellStartsKernel, Mathf.CeilToInt(CellRange / 64.0f), 1, 1);
-
-        input = prefixInputBuffer;
-        output = prefixOutputBuffer;
-
-        for (int offset = 2; offset < CellRange; offset *= 2)
+        if (!initialized) return;
+        float step = 1f / Mathf.Clamp(simulationHz, 30, 240);
+        float elapsed = Mathf.Max(0, Time.deltaTime);
+        float budget = step * Mathf.Clamp(maxSubsteps, 1, 8);
+        DroppedSimulationSeconds += Mathf.Max(0, accumulator + elapsed - budget);
+        accumulator = Mathf.Min(accumulator + elapsed, budget);
+        while (accumulator + 1e-7f >= step)
         {
-            computeShader.SetInt("_Offset", offset);
-
-            computeShader.SetBuffer(updateCellStartsKernel, "_PrefixInput", input);
-            computeShader.SetBuffer(updateCellStartsKernel, "_PrefixOutput", output);
-
-            computeShader.Dispatch(updateCellStartsKernel, Mathf.CeilToInt(CellRange / 64.0f), 1, 1);
-
-            (input, output) = (output, input);
+            SimulateStep(step);
+            accumulator = Mathf.Max(0, accumulator - step);
         }
-        // exclusive 변환 (right shift >>)
-        computeShader.SetBuffer(inclusiveToExclusiveKernel, "_PrefixInput", input);
-        computeShader.SetBuffer(inclusiveToExclusiveKernel, "_CellStarts", cellStartBuffer);
-        computeShader.Dispatch(inclusiveToExclusiveKernel, Mathf.CeilToInt(CellRange / 64.0f), 1, 1);
+        var rp = new RenderParams(renderingMaterial) {
+            worldBounds = new Bounds(Vector3.one * WorldSize * 0.5f, Vector3.one * WorldSize),
+            shadowCastingMode = ShadowCastingMode.Off, receiveShadows = false
+        };
+        Graphics.RenderMeshIndirect(rp, mesh, drawArgs);
+        if (diagnostics && Time.unscaledTime >= nextDiagnostics) RequestDiagnostics();
     }
 
-    void ApplyGravity()
+    // Explicit stepping is also used by the Editor GPU validation harness.
+    public void SimulateStep(float dt)
     {
-        computeShader.SetBuffer(applyGravityKernel, "_Velocities", velocityBuffer);
-        computeShader.SetBuffer(applyGravityKernel, "_NextVelocities", newVelocityBuffer);
-
-        computeShader.Dispatch(applyGravityKernel, Mathf.CeilToInt(count / 64.0f), 1, 1);
-
-        (velocityBuffer, newVelocityBuffer) = (newVelocityBuffer, velocityBuffer);
-    }
-
-    void InitPositions()
-    {
-        Vector3[] positions = new Vector3[count];
-
-        for (int i=0; i < count; i++)
+        if (!initialized) throw new InvalidOperationException("Simulation is not initialized.");
+        if (!(dt > 0 && dt <= 1f / 30f)) throw new ArgumentOutOfRangeException(nameof(dt));
+        simulation.SetFloat("_DeltaTime", dt);
+        simulation.SetFloat("_Friction", Mathf.Clamp01(friction));
+        simulation.SetFloat("_Restitution", Mathf.Clamp01(restitution));
+        simulation.SetFloat("_LinearDamping", Mathf.Max(0, linearDamping));
+        simulation.SetFloat("_AngularDamping", Mathf.Max(0, angularDamping));
+        simulation.Dispatch(resetCounters, 1, 1, 1);
+        simulation.Dispatch(clearGrid, DivideUp(Cells, Threads), 1, 1);
+        DispatchBodies(countCells);
+        BuildCellStarts();
+        DispatchBodies(scatter);
+        Bind(gravity, "_Velocities", velocities); Bind(gravity, "_NextVelocities", nextVelocities);
+        DispatchBodies(gravity);
+        (velocities, nextVelocities) = (nextVelocities, velocities);
+        DispatchBodies(clearHeads);
+        DispatchBodies(boundaryContacts); // Boundary contacts get capacity before body pairs.
+        DispatchBodies(buildContacts);
+        simulation.Dispatch(finalizeContacts, 1, 1, 1);
+        simulation.DispatchIndirect(linkContacts, dispatchArgs);
+        for (int i = 0; i < Mathf.Clamp(solverIterations, 1, 64); i++)
         {
-            int x = i % 100;
-            int y = (i / 100) % 100;
-            int z = i / 10000;
-
-            // positions[i] = new Vector3(x * 1.2f, y * 1.2f, z * 1.2f);
-            positions[i] = new Vector3(10f, i * 5f + 1, 10f);
+            simulation.SetInt("_SolverIteration", i);
+            Bind(solve, "_Velocities", velocities); Bind(solve, "_AngularVelocities", angularVelocities);
+            Bind(apply, "_Velocities", velocities); Bind(apply, "_AngularVelocities", angularVelocities);
+            Bind(apply, "_NextVelocities", nextVelocities);
+            Bind(apply, "_NextAngularVelocities", nextAngularVelocities);
+            simulation.DispatchIndirect(solve, dispatchArgs);
+            DispatchBodies(apply);
+            (velocities, nextVelocities) = (nextVelocities, velocities);
+            (angularVelocities, nextAngularVelocities) = (nextAngularVelocities, angularVelocities);
         }
-        
-        positionBuffer.SetData(positions);
+        Bind(integrate, "_Velocities", velocities); Bind(integrate, "_AngularVelocities", angularVelocities);
+        Bind(integrate, "_NextVelocities", nextVelocities); Bind(integrate, "_NextAngularVelocities", nextAngularVelocities);
+        DispatchBodies(integrate);
+        (velocities, nextVelocities) = (nextVelocities, velocities);
+        (angularVelocities, nextAngularVelocities) = (nextAngularVelocities, angularVelocities);
+        SimulatedSeconds += dt;
     }
 
-    void InitVelocities()
+    void BuildCellStarts()
     {
-        Vector3[] velocities = new Vector3[count];
-
-        for (int i=0; i < count; i++)
+        // Three upward block scans and two downward adds for 1,000,000 cells.
+        for (int i = 0; i < scanLengths.Count; i++)
         {
-            // velocities[i] = new Vector3(Random.Range(-1,1), Random.Range(-1,1), Random.Range(-1,1));
-            velocities[i] = new Vector3(0, 0, 0);
+            simulation.SetInt("_ScanLength", scanLengths[i]);
+            Bind(scan, "_PrefixInput", i == 0 ? cellCounts : scanSums[i - 1]);
+            Bind(scan, "_PrefixOutput", i == 0 ? cellStarts : scanOffsets[i - 1]);
+            Bind(scan, "_BlockSums", scanSums[i]);
+            simulation.Dispatch(scan, DivideUp(scanLengths[i], ScanThreads), 1, 1);
         }
-        velocityBuffer.SetData(velocities);
-        newVelocityBuffer.SetData(velocities);
-    }
-
-    void InitAngularVelocities()
-    {
-        Vector3[] angularVelocities = new Vector3[count];
-
-        angularVelocityBuffer.SetData(angularVelocities);
-        newAngularVelocityBuffer.SetData(angularVelocities);
-    }
-
-    void InitRotations()
-    {
-        Vector4[] rotations = new Vector4[count];
-
-        for (int i = 0; i < count; i++)
+        for (int i = scanLengths.Count - 2; i >= 0; i--)
         {
-            rotations[i] = new Vector4(0, 0, 0, 1);
-        }
-        // rotations[0] = new Vector4(0, 0, 0, 1);
-        // rotations[1] = new Vector4(0, 0, 0, 1);
-
-        rotationBuffer.SetData(rotations);
-    }
-
-    void BuildContactConstraints()
-    {
-        contactCountBuffer.SetData(zeroContactCount);
-
-        computeShader.Dispatch(clearContactHeadsKernel, Mathf.CeilToInt(count / 64.0f), 1, 1);
-        computeShader.Dispatch(buildContactsKernel, Mathf.CeilToInt(count / 64.0f), 1, 1);
-        computeShader.Dispatch(buildFloorContactsKernel, Mathf.CeilToInt(count / 64.0f), 1, 1);
-    }
-
-    void BuildContactLinks()
-    {
-        computeShader.Dispatch(buildContactLinksKernel, (maxContacts + 63) / 64, 1, 1);
-    }
-
-    void BindSolverVelocities()
-    {
-        computeShader.SetBuffer(solveContactImpulsesKernel, "_Velocities", velocityBuffer);
-        computeShader.SetBuffer(solveContactImpulsesKernel, "_AngularVelocities", angularVelocityBuffer);
-        computeShader.SetBuffer(applyContactImpulsesKernel, "_Velocities", velocityBuffer);
-        computeShader.SetBuffer(applyContactImpulsesKernel, "_NextVelocities", newVelocityBuffer);
-        computeShader.SetBuffer(applyContactImpulsesKernel, "_AngularVelocities", angularVelocityBuffer);
-        computeShader.SetBuffer(applyContactImpulsesKernel, "_NextAngularVelocities", newAngularVelocityBuffer);
-    }
-
-    void SwapVelocityBuffers()
-    {
-        (velocityBuffer, newVelocityBuffer) = (newVelocityBuffer, velocityBuffer);
-        (angularVelocityBuffer, newAngularVelocityBuffer) = (newAngularVelocityBuffer, angularVelocityBuffer);
-    }
-    void RunJacobiIterations()
-    {
-        for (int i = 0; i < solverIterations; i++)
-        {
-            BindSolverVelocities();
-
-            computeShader.Dispatch(solveContactImpulsesKernel, (maxContacts + 63) / 64, 1, 1);
-            computeShader.Dispatch(applyContactImpulsesKernel, Mathf.CeilToInt(count / 64.0f), 1, 1);
-
-            SwapVelocityBuffers();
+            simulation.SetInt("_ScanLength", scanLengths[i]);
+            Bind(addOffsets, "_PrefixOutput", i == 0 ? cellStarts : scanOffsets[i - 1]);
+            Bind(addOffsets, "_BlockOffsets", scanOffsets[i]);
+            simulation.Dispatch(addOffsets, DivideUp(scanLengths[i], ScanThreads), 1, 1);
         }
     }
 
-    void DebugGrid()
+    void RequestDiagnostics()
     {
-        uint[] cellCounts = new uint[CellRange];
-        cellCountBuffer.GetData(cellCounts);
-
-        int occupiedCells = 0;
-        int totalObjects = 0;
-
-        foreach (uint cellCount in cellCounts)
-        {
-            if (cellCount > 0)
-                occupiedCells++;
-
-            totalObjects += (int)cellCount;
-        }
-
-        Debug.Log(
-            $"Grid Objects: {totalObjects}, " +
-            $"Occupied Cells: {occupiedCells}"
-        );
-    }
-    void DebugCellCounts()
-    {
-        uint[] cellCounts = new uint[CellRange];
-        cellCountBuffer.GetData(cellCounts);
-
-        for (int i = 0; i < CellRange; i++)
-        {
-            if (cellCounts[i] > 0)
-            {
-                Debug.Log($"Cell {i} : {cellCounts[i]} objects");
-            }
-        }        
+        if (readbackPending || !SystemInfo.supportsAsyncGPUReadback) return;
+        nextDiagnostics = Time.unscaledTime + 1f;
+        readbackPending = true;
+        int requestGeneration = generation;
+        AsyncGPUReadback.Request(contactCount, request => {
+            if (this == null || generation != requestGeneration) return;
+            readbackPending = false;
+            if (request.hasError || !initialized) return;
+            var data = request.GetData<uint>();
+            RequestedContacts = data[0]; PeakCellOccupancy = data[1]; InvalidBodies = data[3];
+            if (ContactOverflow && !overflowReported)
+                Debug.LogWarning($"GPU contact overflow: {RequestedContacts:N0} / {capacity:N0}. Contacts were dropped; increase Max Contacts and restart.", this);
+            overflowReported = ContactOverflow;
+            if (InvalidBodies > 0) Debug.LogError($"GPU solver produced {InvalidBodies} invalid bodies.", this);
+        });
     }
 
-    void DebugVelocities(string label)
+    static void DestroyOwned(UnityEngine.Object value)
     {
-        Vector3[] velocities = new Vector3[2];
-        velocityBuffer.GetData(velocities);
+        if (!value) return;
+        if (Application.isPlaying) Destroy(value); else DestroyImmediate(value);
+    }
 
-        Debug.Log(
-            $"{label} | " +
-            $"A: {velocities[0]}, " +
-            $"B: {velocities[1]}"
-        );
+    void OnDisable() => Release();
+    void OnDestroy() => Release();
+    void Release()
+    {
+        initialized = false;
+        generation++;
+        readbackPending = false;
+        foreach (var buffer in buffers) buffer.Release();
+        buffers.Clear(); scanSums.Clear(); scanOffsets.Clear(); scanLengths.Clear();
+        DestroyOwned(simulation);
+        DestroyOwned(renderingMaterial);
+        simulation = null; renderingMaterial = null;
+        AllocatedBytes = 0; accumulator = 0; nextDiagnostics = 0;
+        SimulatedSeconds = 0; DroppedSimulationSeconds = 0;
+        RequestedContacts = 0; PeakCellOccupancy = 0; InvalidBodies = 0; overflowReported = false;
     }
 }
