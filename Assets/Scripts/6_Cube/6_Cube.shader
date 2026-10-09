@@ -44,11 +44,19 @@ Shader "Custom/6_Cube"
             CBUFFER_END
 
             StructuredBuffer<float3> _Positions;
+            StructuredBuffer<float4> _Rotations;
+
             StructuredBuffer<uint> _Collisions;
 
             float Random(uint seed)
             {
                 return frac(sin(seed) * 12345.6789);
+            }
+
+            float3 RotateByQuaternion(float3 v, float4 q)
+            {
+                float3 t = 2.0f * cross(q.xyz, v);
+                return v + q.w * t + cross(q.xyz, t);
             }
 
             Varyings vert(Attributes IN, uint svInstanceID : SV_InstanceID)
@@ -60,6 +68,9 @@ Shader "Custom/6_Cube"
                 uint instanceID = GetIndirectInstanceID(svInstanceID);
                 
                 float3 pos = IN.positionOS.xyz;
+
+                float4 rot = _Rotations[instanceID];
+                pos = RotateByQuaternion(pos, rot);
                 
                 pos += _Positions[instanceID];
 
